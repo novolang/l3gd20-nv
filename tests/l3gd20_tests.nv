@@ -1,0 +1,306 @@
+// l3gd20_tests — the driver's functions over a double of the part: an
+// SPI bus and a GPIO port that together answer as an L3GD20's register
+// file does (DocID022116 § 5.2), so the command byte, the address
+// increment, the conversions and the bring-up are checked on the host.
+// The board's suite runs the same functions over the board's bus.  The
+// type `L3gd20` holds the board's handles; on the host those are absent
+// hardware, and the last test runs each of its methods over them.
+
+use std.test
+use embedded_hal.{ SpiBus, GpioOut, BoardSpi, BoardGpio }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
+use dev_id.{ Identifiable }
+use l3gd20
+use l3gd20.{ L3gd20 }
+
+// ── The double ───────────────────────────────────────────────────────
+//
+// `regs` is the part's 64 registers.  `st` is the state of the
+// transaction in progress, shared with the GPIO double: key 0 is 0
+// before the command byte and 1 after it, key 1 the register address,
+// key 2 1 for a read, key 3 1 for an incrementing address, key 4 1 when a
+// part is there at all, key 5 the number of transactions begun.  A part
+// that is not there drives nothing, and the bus reads 0xFF.  The state
+// is kept in maps, which a method changes through its receiver.
+
+struct FakePart
+    regs: HashMap<Int, Int>
+    st: HashMap<Int, Int>
+
+fn at(m: HashMap<Int, Int>, k: Int) -> Int
+    m.get(k) ?? 0
+
+impl SpiBus for FakePart
+    fn init(self, freq: Int, mode: Int) [hw]
+        pass
+
+    fn transfer(self, b: Int) -> Int [hw]
+        if at(self.st, 4) == 0
+            return 0xFF
+        if at(self.st, 0) == 0
+            self.st.insert(0, 1)
+            self.st.insert(1, b & 0x3F)
+            self.st.insert(2, (b >> 7) & 1)
+            self.st.insert(3, (b >> 6) & 1)
+            return 0xFF
+        let a = at(self.st, 1)
+        if at(self.st, 3) == 1
+            self.st.insert(1, (a + 1) & 0x3F)
+        if at(self.st, 2) == 1
+            return at(self.regs, a)
+        self.regs.insert(a, b & 0xFF)
+        0xFF
+
+    fn write(self, data: [u8]) [hw]
+        for b in data
+            let _ = self.transfer(b as Int)
+
+    fn read(self, n: Int) -> [u8] [hw]
+        var out: [u8] = []
+        for _i in 0..n
+            list.push(out, self.transfer(0xFF) as u8)
+        out
+
+// The GPIO double: a fall of any pin starts a transaction.  `levels`
+// keeps the last level written to each pin, and `modes` the last mode.
+struct FakePins
+    st: HashMap<Int, Int>
+    levels: HashMap<Int, Int>
+    modes: HashMap<Int, Int>
+
+impl GpioOut for FakePins
+    fn mode(self, pin: Int, dir: Int) [hw]
+        self.modes.insert(pin, dir)
+
+    fn set(self, pin: Int, val: Int) [hw]
+        self.levels.insert(pin, val)
+        if val == 0
+            self.st.insert(0, 0)
+            self.st.insert(5, at(self.st, 5) + 1)
+
+    fn get(self, pin: Int) -> Int [hw]
+        at(self.levels, pin)
+
+// A part answering `who` at WHO_AM_I, with CTRL_REG1 at its reset value.
+fn part(who: Int) -> FakePart
+    let p = FakePart { regs: HashMap.new(), st: HashMap.new() }
+    p.regs.insert(0x0F, who)
+    p.regs.insert(0x20, 0x07)
+    p.st.insert(4, 1)
+    p
+
+fn pins(p: FakePart) -> FakePins
+    FakePins { st: p.st, levels: HashMap.new(), modes: HashMap.new() }
+
+// The board's wiring: chip select PE3 (67), DRDY/INT2 PE1 (65).
+fn wiring() -> DeviceWiring
+    dev_bus.wiring_irq(dev_bus.wiring_spi(0, 67), 65)
+
+// Writes a 16-bit count, low byte first, at `reg`.
+fn put16(p: FakePart, reg: Int, v: Int)
+    let u = v & 0xFFFF
+    p.regs.insert(reg, u & 0xFF)
+    p.regs.insert(reg + 1, u >> 8)
+
+// Sets one register of the part.
+fn poke(p: FakePart, reg: Int, v: Int)
+    p.regs.insert(reg, v)
+
+// ── Register access ──────────────────────────────────────────────────
+
+@test
+fn test_a_read_sets_rw_and_one_register_does_not_increment() [io, hw]
+    let p = part(0xD4)
+    let g = pins(p)
+    test.assert_eq(l3gd20.reg_read(p, g, wiring(), 0x0F) ?? -1, 0xD4)
+    test.assert_eq(at(p.st, 2), 1)
+    test.assert_eq(at(p.st, 3), 0)
+    test.assert_eq(at(g.levels, 67), 1)
+
+@test
+fn test_a_multi_register_read_sets_ms() [io, hw]
+    let p = part(0xD4)
+    put16(p, 0x28, 100)
+    let s = l3gd20.sample_read(p, pins(p), wiring())
+    test.assert_eq(at(p.st, 3), 1)
+    test.assert(s != None)
+
+@test
+fn test_a_write_is_read_back() [io, hw]
+    let p = part(0xD4)
+    test.assert(l3gd20.reg_write(p, pins(p), wiring(), 0x22, 0x08))
+    test.assert_eq(at(p.regs, 0x22), 0x08)
+
+@test
+fn test_a_wiring_with_no_chip_select_sends_nothing() [io, hw]
+    let p = part(0xD4)
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None }
+    test.assert(l3gd20.reg_read(p, pins(p), w, 0x0F) == None)
+    test.assert(not l3gd20.reg_write(p, pins(p), w, 0x20, 0x0F))
+    test.assert(l3gd20.sample_read(p, pins(p), w) == None)
+    test.assert(not l3gd20.start(p, pins(p), w))
+    test.assert_eq(at(p.st, 5), 0)
+
+// ── Samples ──────────────────────────────────────────────────────────
+
+@test
+fn test_a_sample_is_converted_at_the_range_it_was_taken_in() [io, hw]
+    let p = part(0xD4)
+    // 1000 steps at ±250 dps is 8.75 dps; -2000 steps -17.5 dps.
+    put16(p, 0x28, 1000)
+    put16(p, 0x2A, -2000)
+    put16(p, 0x2C, 0)
+    match l3gd20.sample_read(p, pins(p), wiring())
+        Some(s) =>
+            test.assert_eq(s.x, 8750)
+            test.assert_eq(s.y, -17500)
+            test.assert_eq(s.z, 0)
+        None    => test.assert(false)
+    // The same counts at ±2000 dps, 70 mdps a step.
+    poke(p, 0x23, 0xA0)
+    match l3gd20.sample_read(p, pins(p), wiring())
+        Some(s) => test.assert_eq(s.x, 70000)
+        None    => test.assert(false)
+
+@test
+fn test_no_part_reads_as_no_sample() [io, hw]
+    let p = part(0xD4)
+    p.st.insert(4, 0)
+    let g = pins(p)
+    test.assert(l3gd20.sample_read(p, g, wiring()) == None)
+    test.assert(l3gd20.id_read(p, g, wiring()) == None)
+    test.assert(l3gd20.range_read(p, g, wiring()) == GyroRange250dps)
+    test.assert_eq(l3gd20.rate_read(p, g, wiring()), 0)
+    test.assert_eq(l3gd20.rate_write(p, g, wiring(), 95), 0)
+    test.assert(not l3gd20.start(p, g, wiring()))
+    // A bus no part drives answers ZYXDA set; the sample says None.
+    test.assert(l3gd20.sample_ready(p, g, wiring()))
+
+@test
+fn test_the_data_ready_flag() [io, hw]
+    let p = part(0xD4)
+    test.assert(not l3gd20.sample_ready(p, pins(p), wiring()))
+    poke(p, 0x27, 0x08)
+    test.assert(l3gd20.sample_ready(p, pins(p), wiring()))
+
+// ── Ranges and rates ─────────────────────────────────────────────────
+
+@test
+fn test_the_ranges_and_their_codes() [io, hw]
+    let p = part(0xD4)
+    let g = pins(p)
+    test.assert(l3gd20.range_write(p, g, wiring(), GyroRange500dps))
+    test.assert_eq(at(p.regs, 0x23), 0x90)
+    test.assert(l3gd20.range_read(p, g, wiring()) == GyroRange500dps)
+    test.assert(l3gd20.range_write(p, g, wiring(), GyroRange2000dps))
+    test.assert(l3gd20.range_read(p, g, wiring()) == GyroRange2000dps)
+    // FS 11 is ±2000 dps too.
+    test.assert(l3gd20.range_of_ctrl4(0x30) == GyroRange2000dps)
+    test.assert(not l3gd20.range_write(p, g, wiring(), GyroRange1000dps))
+    test.assert_eq(l3gd20.fs_of_range(GyroRange250dps), 0)
+    test.assert_eq(l3gd20.micro_dps_per_lsb(GyroRange500dps), 17500)
+    test.assert_eq(l3gd20.micro_dps_per_lsb(GyroRange1000dps), 35000)
+    test.assert_eq(l3gd20.micro_dps_per_lsb(GyroRange2000dps), 70000)
+
+@test
+fn test_the_rates_round_up_and_keep_the_bandwidth() [io, hw]
+    let p = part(0xD4)
+    let g = pins(p)
+    poke(p, 0x20, 0x30)
+    test.assert_eq(l3gd20.rate_write(p, g, wiring(), 100), 190)
+    test.assert_eq(at(p.regs, 0x20), 0x7F)
+    test.assert_eq(l3gd20.rate_write(p, g, wiring(), 95), 95)
+    test.assert_eq(l3gd20.rate_write(p, g, wiring(), 381), 760)
+    test.assert_eq(l3gd20.rate_write(p, g, wiring(), 200), 380)
+    test.assert_eq(l3gd20.rate_read(p, g, wiring()), 380)
+    test.assert_eq(l3gd20.rate_of_ctrl1(0xC7), 0)
+
+// ── Identity and bring-up ────────────────────────────────────────────
+
+@test
+fn test_both_identities_are_known() [io, hw]
+    test.assert(l3gd20.id_known(0xD4))
+    test.assert(l3gd20.id_known(0xD3))
+    test.assert(not l3gd20.id_known(0xD7))
+    test.assert(l3gd20.ctrl4_answered(0x80))
+    test.assert(not l3gd20.ctrl4_answered(0xFF))
+
+@test
+fn test_the_bring_up_writes_its_settings() [io, hw]
+    let p = part(0xD3)
+    let g = pins(p)
+    test.assert(l3gd20.start(p, g, wiring()))
+    test.assert_eq(at(p.regs, 0x23), 0x80)
+    test.assert_eq(at(p.regs, 0x22), 0x08)
+    test.assert_eq(at(p.regs, 0x20), 0x0F)
+    // Chip select is an output, high; the interrupt pin an input.
+    test.assert_eq(at(g.modes, 67), 1)
+    test.assert_eq(at(g.levels, 67), 1)
+    test.assert_eq(at(g.modes, 65), 0)
+    match l3gd20.id_read(p, g, wiring())
+        Some(id) => test.assert_eq(id.who, 0xD3)
+        None     => test.assert(false)
+
+@test
+fn test_an_unknown_part_is_refused() [io, hw]
+    let p = part(0xD7)
+    test.assert(not l3gd20.start(p, pins(p), wiring()))
+    test.assert_eq(at(p.regs, 0x20), 0x07)
+
+@test
+fn test_the_interrupt_line() [io, hw]
+    let p = part(0xD4)
+    let g = pins(p)
+    g.levels.insert(65, 1)
+    test.assert_eq(l3gd20.irq_level_of(g, wiring()), 1)
+    test.assert_eq(l3gd20.irq_level_of(g, dev_bus.wiring_spi(0, 67)), -1)
+
+// ── The driver's type over the board's handles ───────────────────────
+//
+// On a host the board's SPI bus is absent hardware whose every byte
+// reads 0, and the GPIO port prints each write.  So the part reads as
+// powered down at ±250 dps with every register 0: a write of 0 reads
+// back and is taken, any other write is refused, and WHO_AM_I's 0 is no
+// part.
+
+@test
+fn test_the_driver_over_a_bus_that_reads_zero() [io, hw]
+    let d = L3gd20.attach(BoardSpi { id: 0 }, BoardGpio { id: 0 }, wiring())
+    test.assert(not d.begin())
+    test.assert_eq(d.set_rate_hz(95), 0)
+    test.assert_eq(d.irq_level(), 0)
+    test.assert_eq(d.reg(0x0F) ?? -1, 0)
+    test.assert(not d.set_reg(0x20, 0x0F))
+    test.assert(d.set_reg(0x20, 0))
+    test.assert(not d.gyro_read() == None)
+    test.assert(not d.gyro_ready())
+    test.assert(d.gyro_range() == GyroRange250dps)
+    test.assert(not d.gyro_set_range(GyroRange500dps))
+    test.assert_eq(d.gyro_rate_hz(), 0)
+    test.assert(d.device_id() == None)
+
+// ── The helpers a caller with its own bus uses ───────────────────────
+
+@test
+fn test_a_burst_read_into_the_callers_bytes() [io, hw]
+    let p = part(0xD4)
+    p.regs.insert(0x21, 0x29)
+    var b: DevBytes = Vec.new()
+    test.assert(l3gd20.reg_read_into(p, pins(p), wiring(), 0x20, 2, b))
+    test.assert_eq(b.len(), 2)
+    test.assert_eq(b[0] as Int, 0x07)
+    test.assert_eq(b[1] as Int, 0x29)
+    var none: DevBytes = Vec.new()
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None }
+    test.assert(not l3gd20.reg_read_into(p, pins(p), w, 0x20, 2, none))
+
+@test
+fn test_the_rate_bits_round_up() [io]
+    test.assert_eq(l3gd20.dr_for_rate(1), 0)
+    test.assert_eq(l3gd20.dr_for_rate(95), 0)
+    test.assert_eq(l3gd20.dr_for_rate(96), 1)
+    test.assert_eq(l3gd20.dr_for_rate(190), 1)
+    test.assert_eq(l3gd20.dr_for_rate(380), 2)
+    test.assert_eq(l3gd20.dr_for_rate(381), 3)
+    test.assert_eq(l3gd20.dr_for_rate(5000), 3)
