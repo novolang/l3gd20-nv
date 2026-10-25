@@ -249,3 +249,12 @@ fn test_the_interrupt_line() [io, hw]
     g.levels.insert(65, 1)
     test.assert_eq(l3gd20.irq_level_of(g, wiring()), 1)
     test.assert_eq(l3gd20.irq_level_of(g, dev_bus.wiring_spi(0, 67)), -1)
+
+@test
+fn test_every_range_has_its_data_sheet_step() [io, hw]
+    test.assert_eq(l3gd20.micro_dps_per_lsb(GyroRange250dps), 8750)
+    test.assert_eq(l3gd20.micro_dps_per_lsb(GyroRange500dps), 17500)
+    test.assert_eq(l3gd20.micro_dps_per_lsb(GyroRange2000dps), 70000)
+    test.assert_eq(l3gd20.fs_of_range(GyroRange500dps), 1)
+    test.assert_eq(l3gd20.fs_of_range(GyroRange1000dps), -1)
+    test.assert_eq(l3gd20.fs_of_range(GyroRange2000dps), 2)

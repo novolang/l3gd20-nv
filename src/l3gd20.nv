@@ -97,12 +97,12 @@ pub fn reg_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, re
     if n > 1
         cmd = cmd | CMD_MULTI
     let _ = tx.push(cmd as u8)
-    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, dst)
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, var dst)
 
 // One register's byte, or `None` for a wiring with no chip select.
 pub fn reg_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int) -> ?Int [hw]
     var b: DevBytes = Vec.new()
-    if not reg_read_into(bus, gpio, w, reg, 1, b)
+    if not reg_read_into(bus, gpio, w, reg, 1, var b)
         return None
     Some(b[0] as Int)
 
@@ -114,7 +114,7 @@ pub fn reg_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: I
     let _ = tx.push((reg & 0x3F) as u8)
     let _ = tx.push((v & 0xFF) as u8)
     var none: DevBytes = Vec.new()
-    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, none)
+    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, var none)
         return false
     reg_read(bus, gpio, w, reg) == Some(v & 0xFF)
 
@@ -181,7 +181,7 @@ fn axis(b: DevBytes, i: Int) -> Int
 // then the three axes.  `None` when no part answers.
 pub fn sample_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> ?GyroMilliDps [hw]
     var b: DevBytes = Vec.new()
-    if not reg_read_into(bus, gpio, w, CTRL_REG4, 11, b)
+    if not reg_read_into(bus, gpio, w, CTRL_REG4, 11, var b)
         return None
     let ctrl4 = b[0] as Int
     if not ctrl4_answered(ctrl4)
@@ -284,6 +284,7 @@ struct L3gd20
     pins: BoardGpio
     w: DeviceWiring
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl L3gd20
     // The part on the board's SPI bus with the chip select `w.cs`, as a
     // board's device table builds it.  Nothing is sent.
@@ -312,6 +313,7 @@ impl L3gd20
     fn set_reg(self, r: Int, v: Int) -> Bool [hw]
         reg_write(self.bus, self.pins, self.w, r, v)
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Gyroscope[hw] for L3gd20
     fn gyro_read(self) -> ?GyroMilliDps [hw]
         sample_read(self.bus, self.pins, self.w)
@@ -328,6 +330,7 @@ impl Gyroscope[hw] for L3gd20
     fn gyro_rate_hz(self) -> Int [hw]
         rate_read(self.bus, self.pins, self.w)
 
+// cov: skip — the type holds the board's bus handles, which exist only on a board; each method forwards to the function of the same name that the host suite covers, and a board package's suite runs these lines on the board.
 impl Identifiable[hw] for L3gd20
     // WHO_AM_I: 0xD4 for an L3GD20, 0xD3 for an I3G4250D; the part keeps
     // no revision register, so `rev` is `None`.
