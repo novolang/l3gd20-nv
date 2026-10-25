@@ -1,0 +1,335 @@
+// l3gd20 — ST's L3GD20 three-axis gyroscope on its SPI bus, as
+// devices-nv's `Gyroscope` and `Identifiable`.
+//
+// The part is described by ST's data sheet DocID022116 (Rev 2, February
+// 2013); the sections named below are that sheet's.  ST's I3G4250D,
+// which later STM32F3DISCOVERY boards carry in the same place, has the
+// same registers and sensitivities and answers 0xD3 at WHO_AM_I where
+// the L3GD20 answers 0xD4; the driver takes either.
+//
+// The register map (§ 7, Table 17), as this driver uses it:
+//
+//   0x0F  WHO_AM_I    0xD4 (L3GD20), 0xD3 (I3G4250D)
+//   0x20  CTRL_REG1   DR (7:6), BW (5:4), PD (3), Zen (2), Xen (1), Yen (0)
+//   0x22  CTRL_REG3   I1_Int1 (7), I1_Boot (6), H_Lactive (5), PP_OD (4),
+//                     I2_DRDY (3), I2_WTM (2), I2_ORun (1), I2_Empty (0)
+//   0x23  CTRL_REG4   BDU (7), BLE (6), FS (5:4), SIM (0); bits 2 and 1
+//                     are 0 and must stay 0
+//   0x27  STATUS_REG  ZYXDA (3): a new sample of all three axes
+//   0x28  OUT_X_L to 0x2D OUT_Z_H: each axis a 16-bit two's complement
+//         count, low byte first
+//
+// The full scale and its sensitivity (§ 2.1, Table 4): FS 00 is ±250
+// dps at 8.75 mdps per step, 01 ±500 at 17.50, 10 and 11 ±2000 at 70.
+// The part has no ±1000 dps range.  The output data rate (§ 7.2, Table
+// 21): DR 00 is 95 Hz, 01 190, 10 380, 11 760.
+//
+// An SPI transaction (§ 5.2) is a command byte, then the data, inside
+// one chip-select window: bit 7 of the command is RW (1 reads), bit 6 is
+// MS (1 increments the register address after each byte), bits 5 to 0
+// the register.  The part drives SDO on SPC's falling edge and samples
+// SDI on its rising edge, with SPC idle high, which is SPI mode 3.
+//
+// What the drivers read before this one keep, and this driver keeps,
+// each named where it is kept: japaric's `l3gd20` crate (read at
+// 37cbb89; MIT/Apache, nothing written from it), the driver of the
+// STM32F3DISCOVERY's Rust board crate `f3`, sets MS for a read of more
+// than one register and RW for every read; ST's board support for the
+// STM32F3DISCOVERY in STM32CubeF3 (`stm32f3_discovery.c`,
+// `GYRO_IO_Init`) drives chip select high before the first
+// transaction.
+//
+// The driver holds no state: the range and the rate are read from the
+// part when they are needed, in the same transaction as the sample where
+// the sample needs them, so two copies of the driver's value agree.
+//
+// The functions over a bus take it as a type parameter, so the tests run
+// them over a double of the part; the methods of `L3gd20` call them with
+// the board's bus.
+
+use embedded_hal.{ BoardSpi, BoardGpio, SpiBus, GpioOut }
+use dev_bus.{ DeviceWiring, DevBytes }
+use dev_gyro.{ GyroMilliDps, GyroRange, Gyroscope }
+use dev_id.{ DeviceId, Identifiable }
+
+// The registers.
+let WHO_AM_I   = 0x0F
+let CTRL_REG1  = 0x20
+let CTRL_REG3  = 0x22
+let CTRL_REG4  = 0x23
+let STATUS_REG = 0x27
+
+// The command byte's RW and MS bits.
+let CMD_READ  = 0x80
+let CMD_MULTI = 0x40
+
+// The identities WHO_AM_I answers.
+let ID_L3GD20   = 0xD4
+let ID_I3G4250D = 0xD3
+
+// CTRL_REG1: normal mode with the three axes on (PD, Zen, Xen, Yen).
+// The axis bits run Z, X, Y from bit 2 down (§ 7.2, Table 19), not X, Y,
+// Z; all three set is 0x07 either way.
+let CTRL1_ON = 0x0F
+// CTRL_REG3: data-ready on the DRDY/INT2 pin.
+let CTRL3_I2_DRDY = 0x08
+// CTRL_REG4: block data update, so the low and high bytes of an axis
+// come from one sample (§ 7.5, Table 30).
+let CTRL4_BDU = 0x80
+// STATUS_REG: a new sample of all three axes.
+let STATUS_ZYXDA = 0x08
+
+// The SPI clock `begin` asks for.  The part takes up to 10 MHz (§ 2.4.1,
+// Table 7); the controller gives the fastest rate at or below this.
+let SPI_HZ   = 4000000
+let SPI_MODE = 3
+
+// Reads `n` registers from `reg` into `dst` in one transaction: RW set,
+// and MS set when `n` is more than one, as japaric's `l3gd20` crate does
+// (`read_many`), since without MS every byte repeats the first register.
+// Answers whether the transaction ran, which on SPI is whether the
+// wiring has a chip select: an absent part reads 0xFF, which the callers
+// check for.
+pub fn reg_read_into<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int, n: Int,
+                                            var dst: DevBytes) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    var cmd = CMD_READ | (reg & 0x3F)
+    if n > 1
+        cmd = cmd | CMD_MULTI
+    let _ = tx.push(cmd as u8)
+    dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, n, dst)
+
+// One register's byte, or `None` for a wiring with no chip select.
+pub fn reg_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int) -> ?Int [hw]
+    var b: DevBytes = Vec.new()
+    if not reg_read_into(bus, gpio, w, reg, 1, b)
+        return None
+    Some(b[0] as Int)
+
+// Writes `v` to the register `reg` and reads it back: whether the part
+// holds the value written.  An absent part reads back 0xFF.
+pub fn reg_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, reg: Int,
+                                        v: Int) -> Bool [hw]
+    var tx: DevBytes = Vec.new()
+    let _ = tx.push((reg & 0x3F) as u8)
+    let _ = tx.push((v & 0xFF) as u8)
+    var none: DevBytes = Vec.new()
+    if not dev_bus.wiring_spi_exchange_into(bus, gpio, w, tx, 0, none)
+        return false
+    reg_read(bus, gpio, w, reg) == Some(v & 0xFF)
+
+// Whether a CTRL_REG4 byte is one a present part answers: its bits 2
+// and 1 are 0 on the part, and a bus no part drives reads 0xFF.
+pub fn ctrl4_answered(v: Int) -> Bool
+    (v & 0x06) == 0
+
+// The range a CTRL_REG4 byte's FS bits select: 10 and 11 are both ±2000
+// dps (§ 7.5, Table 30).
+pub fn range_of_ctrl4(v: Int) -> GyroRange
+    match (v >> 4) & 3
+        0 => GyroRange250dps
+        1 => GyroRange500dps
+        _ => GyroRange2000dps
+
+// The FS bits for a range, or -1 for ±1000 dps, which the part lacks.
+pub fn fs_of_range(r: GyroRange) -> Int
+    match r
+        GyroRange250dps  => 0
+        GyroRange500dps  => 1
+        GyroRange1000dps => -1
+        GyroRange2000dps => 2
+
+// The sensitivity of a range in micro-dps per step (§ 2.1, Table 4).
+// The part's ±2000 dps step is 70 mdps, not 2000 over 2^15: the data
+// sheet's sensitivity is the one to use.
+pub fn micro_dps_per_lsb(r: GyroRange) -> Int
+    match r
+        GyroRange250dps  => 8750
+        GyroRange500dps  => 17500
+        GyroRange1000dps => 35000
+        GyroRange2000dps => 70000
+
+// The rate in hertz a CTRL_REG1 byte selects, 0 when PD is clear and
+// the part is powered down (§ 7.2, Table 21 and Table 22).
+pub fn rate_of_ctrl1(v: Int) -> Int
+    if (v & 0x08) == 0
+        return 0
+    match (v >> 6) & 3
+        0 => 95
+        1 => 190
+        2 => 380
+        _ => 760
+
+// The DR bits of the slowest rate at or above `hz`, or of the fastest,
+// 760 Hz, for a rate beyond it.
+pub fn dr_for_rate(hz: Int) -> Int
+    if hz <= 95
+        return 0
+    if hz <= 190
+        return 1
+    if hz <= 380
+        return 2
+    3
+
+// The signed count of an axis whose low byte is at `i` of `b`.
+fn axis(b: DevBytes, i: Int) -> Int
+    dev_bus.dev_sign_extend((b[i + 1] as Int << 8) | b[i] as Int, 16)
+
+// The most recent sample, in one transaction of eleven registers from
+// CTRL_REG4 to OUT_Z_H, so the range it is converted with is the one it
+// was taken in: CTRL_REG4, CTRL_REG5, REFERENCE, OUT_TEMP, STATUS_REG,
+// then the three axes.  `None` when no part answers.
+pub fn sample_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> ?GyroMilliDps [hw]
+    var b: DevBytes = Vec.new()
+    if not reg_read_into(bus, gpio, w, CTRL_REG4, 11, b)
+        return None
+    let ctrl4 = b[0] as Int
+    if not ctrl4_answered(ctrl4)
+        return None
+    let k = micro_dps_per_lsb(range_of_ctrl4(ctrl4))
+    Some(GyroMilliDps { x: dev_gyro.gyro_milli_dps(axis(b, 5), 16, k),
+                        y: dev_gyro.gyro_milli_dps(axis(b, 7), 16, k),
+                        z: dev_gyro.gyro_milli_dps(axis(b, 9), 16, k) })
+
+// Whether a new sample of all three axes has completed since the last
+// read: STATUS_REG's ZYXDA.  An absent part reads 0xFF, so this answers
+// true for it; `sample_read` then answers `None`.
+pub fn sample_ready<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    ((reg_read(bus, gpio, w, STATUS_REG) ?? 0) & STATUS_ZYXDA) != 0
+
+// The range the part is set to, ±250 dps when no part answers.
+pub fn range_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> GyroRange [hw]
+    let v = reg_read(bus, gpio, w, CTRL_REG4) ?? 0xFF
+    if not ctrl4_answered(v)
+        return GyroRange250dps
+    range_of_ctrl4(v)
+
+// Sets the range, with block data update on: whether the part took it.
+// ±1000 dps is refused, the part has no such range.
+pub fn range_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring,
+                                          r: GyroRange) -> Bool [hw]
+    let code = fs_of_range(r)
+    if code < 0
+        return false
+    reg_write(bus, gpio, w, CTRL_REG4, CTRL4_BDU | (code << 4))
+
+// The rate the part samples at in hertz, 0 when it is powered down or
+// no part answers.
+pub fn rate_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Int [hw]
+    let v = reg_read(bus, gpio, w, CTRL_REG1) ?? 0
+    if v == 0xFF
+        return 0
+    rate_of_ctrl1(v)
+
+// Sets the slowest rate at or above `hz` with the part on and its three
+// axes enabled, and the bandwidth bits left as they were: the rate the
+// part took in hertz, or 0 when it did not take it.
+pub fn rate_write<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring, hz: Int) -> Int [hw]
+    let old = reg_read(bus, gpio, w, CTRL_REG1) ?? 0
+    let v = (dr_for_rate(hz) << 6) | (old & 0x30) | CTRL1_ON
+    if not reg_write(bus, gpio, w, CTRL_REG1, v)
+        return 0
+    rate_of_ctrl1(v)
+
+// The identity at WHO_AM_I, or `None` when no part answers (the byte
+// reads 0xFF or 0x00).
+pub fn id_read<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> ?DeviceId [hw]
+    let who = reg_read(bus, gpio, w, WHO_AM_I) ?? 0xFF
+    if who == 0xFF or who == 0
+        return None
+    Some(DeviceId { who: who, rev: None })
+
+// Whether `who` is a part this driver drives: 0xD4 or 0xD3.
+pub fn id_known(who: Int) -> Bool
+    who == ID_L3GD20 or who == ID_I3G4250D
+
+// Brings the part up: chip select driven high first, as STM32CubeF3's
+// `GYRO_IO_Init` does before the first transaction, so
+// the part does not see a select edge from the pin's reset state; the
+// bus at 4 MHz in mode 3; block data update at ±250 dps, data-ready on
+// DRDY/INT2, and 95 Hz with the three axes on.  The interrupt pin, when
+// the wiring has one, is made an input.  Answers whether the part is one
+// this driver drives and took every setting.
+pub fn start<B: SpiBus, G: GpioOut>(bus: B, gpio: G, w: DeviceWiring) -> Bool [hw]
+    let Some(cs) = w.cs else return false
+    // The output level first, then the mode, so the pin never drives low.
+    gpio.set(cs, 1)
+    gpio.mode(cs, 1)
+    if let Some(irq) = w.irq
+        gpio.mode(irq, 0)
+    bus.init(SPI_HZ, SPI_MODE)
+    // The part is an I2C target while chip select is high (§ 5), so
+    // clock edges on the bus before the first select can leave its
+    // interface mid-frame: on the bench, the first read after SPI traffic
+    // with the chip deselected answered WHO_AM_I one bit late (0x68 for
+    // 0xD3).  One read is spent to bring the interface back in step.
+    let _first = reg_read(bus, gpio, w, WHO_AM_I)
+    if not id_known(reg_read(bus, gpio, w, WHO_AM_I) ?? 0xFF)
+        return false
+    // Each setting is written and read back; the first the part refuses
+    // ends the bring-up.
+    reg_write(bus, gpio, w, CTRL_REG4, CTRL4_BDU) and reg_write(bus, gpio, w, CTRL_REG3, CTRL3_I2_DRDY) and reg_write(bus, gpio, w, CTRL_REG1, CTRL1_ON)
+
+// The level of the part's DRDY/INT2 line on the board, 1 or 0, or -1
+// for a wiring with no interrupt pin.
+pub fn irq_level_of<G: GpioOut>(gpio: G, w: DeviceWiring) -> Int [hw]
+    let Some(irq) = w.irq else return -1
+    gpio.get(irq)
+
+// The part on a board: the SPI bus, the board's GPIO for the chip select
+// and the interrupt line, and the wiring.
+pub @value
+struct L3gd20
+    bus: BoardSpi
+    pins: BoardGpio
+    w: DeviceWiring
+
+impl L3gd20
+    // The part on the board's SPI bus with the chip select `w.cs`, as a
+    // board's device table builds it.  Nothing is sent.
+    fn attach(bus: BoardSpi, pins: BoardGpio, w: DeviceWiring) -> L3gd20
+        L3gd20 { bus: bus, pins: pins, w: w }
+
+    // Brings the part up (`start`): whether it answered as an L3GD20 or
+    // an I3G4250D and took every setting.
+    fn begin(self) -> Bool [hw]
+        start(self.bus, self.pins, self.w)
+
+    // Sets the sample rate to the slowest at or above `hz`, 95 to 760 Hz,
+    // and answers the rate taken, 0 when the part did not take it.
+    fn set_rate_hz(self, hz: Int) -> Int [hw]
+        rate_write(self.bus, self.pins, self.w, hz)
+
+    // The level of the DRDY/INT2 line, -1 when the wiring has none.
+    fn irq_level(self) -> Int [hw]
+        irq_level_of(self.pins, self.w)
+
+    // One register's byte, `None` for a wiring with no chip select.
+    fn reg(self, r: Int) -> ?Int [hw]
+        reg_read(self.bus, self.pins, self.w, r)
+
+    // Writes a register and reads it back: whether the part holds it.
+    fn set_reg(self, r: Int, v: Int) -> Bool [hw]
+        reg_write(self.bus, self.pins, self.w, r, v)
+
+impl Gyroscope[hw] for L3gd20
+    fn gyro_read(self) -> ?GyroMilliDps [hw]
+        sample_read(self.bus, self.pins, self.w)
+
+    fn gyro_ready(self) -> Bool [hw]
+        sample_ready(self.bus, self.pins, self.w)
+
+    fn gyro_range(self) -> GyroRange [hw]
+        range_read(self.bus, self.pins, self.w)
+
+    fn gyro_set_range(self, r: GyroRange) -> Bool [hw]
+        range_write(self.bus, self.pins, self.w, r)
+
+    fn gyro_rate_hz(self) -> Int [hw]
+        rate_read(self.bus, self.pins, self.w)
+
+impl Identifiable[hw] for L3gd20
+    // WHO_AM_I: 0xD4 for an L3GD20, 0xD3 for an I3G4250D; the part keeps
+    // no revision register, so `rev` is `None`.
+    fn device_id(self) -> ?DeviceId [hw]
+        id_read(self.bus, self.pins, self.w)
