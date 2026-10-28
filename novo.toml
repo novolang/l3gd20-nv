@@ -1,6 +1,6 @@
 [package]
 name        = "l3gd20-nv"
-version     = "0.1.1"
+version     = "0.1.2"
 description = "A driver for ST's L3GD20 three-axis gyroscope, and the register-compatible I3G4250D, on an SPI bus: the angular rate in milli-degrees per second, the range, the sample rate, the data-ready line and WHO_AM_I, as devices-nv's Gyroscope and Identifiable."
 license     = "Apache-2.0"
 stability   = "experimental"
@@ -20,4 +20,4 @@ novo        = ">= 0.21.1"
 embedded-hal-nv = "^0.2.1"
 # The wiring record a board's device table hands `attach`, the SPI
 # transaction helper, and the Gyroscope and Identifiable traits.
-devices-nv      = "^0.2.0"
+devices-nv      = "^0.3.2"
