@@ -123,6 +123,39 @@ fn test_a_multi_register_read_sets_ms() [io, hw]
     test.assert(s != None)
 
 @test
+fn test_reg_read_into_fills_the_buffer_from_one_transaction() [io, hw]
+    let p = part(0xD4)
+    poke(p, 0x28, 11)
+    poke(p, 0x29, 22)
+    poke(p, 0x2A, 33)
+    var dst: dev_bus.DevBytes = Vec.new()
+    test.assert(l3gd20.reg_read_into(p, pins(p), wiring(), 0x28, 3, var dst))
+    test.assert_eq(dst[0] as Int, 11)
+    test.assert_eq(dst[1] as Int, 22)
+    test.assert_eq(dst[2] as Int, 33)
+    test.assert_eq(at(p.st, 3), 1)
+    test.assert_eq(at(p.st, 5), 1)
+
+@test
+fn test_reg_read_into_refuses_a_wiring_with_no_chip_select() [io, hw]
+    let p = part(0xD4)
+    let w = DeviceWiring { bus: 0, addr: None, cs: None, irq: None, en: None }
+    var dst: dev_bus.DevBytes = Vec.new()
+    test.assert(not l3gd20.reg_read_into(p, pins(p), w, 0x28, 3, var dst))
+    test.assert_eq(at(p.st, 5), 0)
+
+@test
+fn test_the_rate_code_is_the_slowest_rate_that_covers_the_request() [io, hw]
+    test.assert_eq(l3gd20.dr_for_rate(1), 0)
+    test.assert_eq(l3gd20.dr_for_rate(95), 0)
+    test.assert_eq(l3gd20.dr_for_rate(96), 1)
+    test.assert_eq(l3gd20.dr_for_rate(190), 1)
+    test.assert_eq(l3gd20.dr_for_rate(191), 2)
+    test.assert_eq(l3gd20.dr_for_rate(380), 2)
+    test.assert_eq(l3gd20.dr_for_rate(381), 3)
+    test.assert_eq(l3gd20.dr_for_rate(5000), 3)
+
+@test
 fn test_a_write_is_read_back() [io, hw]
     let p = part(0xD4)
     test.assert(l3gd20.reg_write(p, pins(p), wiring(), 0x22, 0x08))
@@ -152,12 +185,12 @@ fn test_a_sample_is_converted_at_the_range_it_was_taken_in() [io, hw]
             test.assert_eq(s.x, 8750)
             test.assert_eq(s.y, -17500)
             test.assert_eq(s.z, 0)
-        None => test.assert(false)
+        None    => test.assert(false)
     // The same counts at ±2000 dps, 70 mdps a step.
     poke(p, 0x23, 0xA0)
     match l3gd20.sample_read(p, pins(p), wiring())
         Some(s) => test.assert_eq(s.x, 70000)
-        None => test.assert(false)
+        None    => test.assert(false)
 
 @test
 fn test_no_part_reads_as_no_sample() [io, hw]
@@ -234,7 +267,7 @@ fn test_the_bring_up_writes_its_settings() [io, hw]
     test.assert_eq(at(g.modes, 65), 0)
     match l3gd20.id_read(p, g, wiring())
         Some(id) => test.assert_eq(id.who, 0xD3)
-        None => test.assert(false)
+        None     => test.assert(false)
 
 @test
 fn test_an_unknown_part_is_refused() [io, hw]
